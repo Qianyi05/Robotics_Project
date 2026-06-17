@@ -1,0 +1,33 @@
+include "map.inc"
+
+resolution 0.05
+interval_sim 100
+
+window
+(
+  size [ 800 800 ]
+  scale 20
+)
+
+floorplan
+(
+  name "map"
+  bitmap "../map/tiny_stage_map.pgm"
+  size [ 10.0 10.0 0.5 ]
+  pose [ 0 0 0 0 ]
+)
+
+define scout_mini position
+(
+  size [ 0.93 0.70 0.40 ]
+  origin [ 0 0 0 0 ]
+  drive "omni"
+  gui_nose 1
+  color "blue"
+)
+
+scout_mini
+(
+  name "scout"
+  pose [ 0 0 0 0 ]
+)

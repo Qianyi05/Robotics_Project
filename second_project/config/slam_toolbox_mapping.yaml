@@ -1,0 +1,33 @@
+slam_toolbox:
+  ros__parameters:
+    use_sim_time: true
+
+    # Frames from the bag TF tree. Verify with view_frames before final submission.
+    map_frame: map
+    odom_frame: UGV_odom
+    base_frame: UGV_base_link
+
+    # PointCloud2 is converted to this LaserScan topic by mapping.launch.py
+    scan_topic: /base_scan
+    mode: mapping
+
+    # Map and timing
+    resolution: 0.05
+    map_update_interval: 2.0
+    transform_publish_period: 0.02
+
+    # Laser limits, aligned with pointcloud_to_laserscan parameters
+    min_laser_range: 0.2
+    max_laser_range: 30.0
+
+    # TF buffer
+    transform_timeout: 0.2
+    tf_buffer_duration: 30.0
+
+    # Avoid processing nearly identical scans
+    minimum_travel_distance: 0.05
+    minimum_travel_heading: 0.05
+
+    # SLAM options
+    use_scan_matching: true
+    do_loop_closing: true
