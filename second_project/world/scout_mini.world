@@ -69,8 +69,8 @@ define scout_mini position
     sensor
     (
       range [ 0.0 20.0 ]
-      fov 270.0
-      samples 1080
+      fov 360.0
+      samples 1440
     )
   )
 )

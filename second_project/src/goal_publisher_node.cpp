@@ -6,9 +6,12 @@
 #include <vector>
 #include <string>
 #include <unordered_map>
+#include <deque>
+#include <cmath>
 
 #include "rclcpp/rclcpp.hpp"
 #include "rclcpp_action/rclcpp_action.hpp"
+#include "geometry_msgs/msg/twist.hpp"
 #include "nav2_msgs/action/navigate_to_pose.hpp"
 #include "nav2_msgs/srv/clear_entire_costmap.hpp"
 #include "visualization_msgs/msg/marker.hpp"
@@ -79,12 +82,15 @@ public:
     using NavigateToPose = nav2_msgs::action::NavigateToPose;
     using GoalHandleNav = rclcpp_action::ClientGoalHandle<NavigateToPose>;
     using ClearEntireCostmap = nav2_msgs::srv::ClearEntireCostmap;
+    using Twist = geometry_msgs::msg::Twist;
     using Marker = visualization_msgs::msg::Marker;
     using MarkerArray = visualization_msgs::msg::MarkerArray;
 
     GoalPublisherNode()
         : Node("goal_publisher_node"),
-          current_goal_index_(0)
+          current_goal_index_(0),
+          escape_publish_count_(0),
+          escaping_(false)
     {
         action_client_ =
             rclcpp_action::create_client<NavigateToPose>(
@@ -108,6 +114,23 @@ public:
                 rclcpp::QoS(1).transient_local().reliable()
             );
 
+        cmd_vel_publisher_ =
+            this->create_publisher<Twist>(
+                "/cmd_vel",
+                rclcpp::QoS(10)
+            );
+
+        cmd_vel_subscription_ =
+            this->create_subscription<Twist>(
+                "/cmd_vel",
+                rclcpp::QoS(10),
+                std::bind(
+                    &GoalPublisherNode::cmd_vel_callback,
+                    this,
+                    std::placeholders::_1
+                )
+            );
+
         std::string package_share_dir =
             ament_index_cpp::get_package_share_directory("second_project");
 
@@ -120,6 +143,7 @@ public:
         );
 
         goals_ = readGoalsFromCSV(csv_path);
+        abort_counts_.assign(goals_.size(), 0);
 
         if (goals_.empty()) {
             RCLCPP_ERROR(
@@ -142,10 +166,26 @@ public:
     }
 
 private:
+    static constexpr double kEscapeSpeed = 0.10;
+    static constexpr double kEscapeDurationSeconds = 1.5;
+    static constexpr double kCmdVelHistorySeconds = 1.0;
+    static constexpr double kMinimumRecordedSpeed = 0.03;
+    static constexpr int kEscapeTimerPeriodMs = 100;
+    static constexpr int kEscapePublishLimit =
+        static_cast<int>(
+            kEscapeDurationSeconds * 1000.0 / kEscapeTimerPeriodMs
+        );
+    static constexpr int kMaxAbortFailuresPerGoal = 2;
+
     enum class LogLevel {
         Info,
         Warn,
         Error
+    };
+
+    struct TimedTwist {
+        rclcpp::Time stamp;
+        Twist twist;
     };
 
     void log_if_changed(
@@ -227,7 +267,15 @@ private:
         }
     }
 
-    void publish_next_goal_marker(const Goal& goal, size_t goal_index) {
+    double get_goal_yaw(size_t goal_index) const {
+        return goals_[goal_index].theta;
+    }
+
+    void publish_next_goal_marker(
+        const Goal& goal,
+        size_t goal_index,
+        double goal_yaw
+    ) {
         MarkerArray marker_array;
 
         Marker delete_previous_markers;
@@ -257,7 +305,7 @@ private:
         marker_array.markers.push_back(goal_marker);
 
         tf2::Quaternion q;
-        q.setRPY(0.0, 0.0, goal.theta);
+        q.setRPY(0.0, 0.0, goal_yaw);
         q.normalize();
 
         Marker heading_marker;
@@ -352,14 +400,19 @@ private:
         goal_msg.pose.header.stamp = this->now();
 
         const auto& current_goal = goals_[current_goal_index_];
-        publish_next_goal_marker(current_goal, current_goal_index_);
+        const double goal_yaw = get_goal_yaw(current_goal_index_);
+        publish_next_goal_marker(
+            current_goal,
+            current_goal_index_,
+            goal_yaw
+        );
 
         goal_msg.pose.pose.position.x = current_goal.x;
         goal_msg.pose.pose.position.y = current_goal.y;
         goal_msg.pose.pose.position.z = 0.0;
 
         tf2::Quaternion q;
-        q.setRPY(0.0, 0.0, current_goal.theta);
+        q.setRPY(0.0, 0.0, goal_yaw);
         q.normalize();
 
         goal_msg.pose.pose.orientation.x = q.x();
@@ -369,12 +422,12 @@ private:
 
         RCLCPP_INFO(
             this->get_logger(),
-            "Sending goal %zu/%zu: x=%.2f, y=%.2f, theta=%.2f",
+            "Sending goal %zu/%zu: x=%.2f, y=%.2f, yaw=%.2f",
             current_goal_index_ + 1,
             goals_.size(),
             current_goal.x,
             current_goal.y,
-            current_goal.theta
+            goal_yaw
         );
 
         auto send_goal_options =
@@ -430,6 +483,179 @@ private:
         );
     }
 
+    void prune_cmd_vel_history(const rclcpp::Time& now) {
+        while (
+            !cmd_vel_history_.empty() &&
+            (now - cmd_vel_history_.front().stamp).seconds() >
+                kCmdVelHistorySeconds
+        ) {
+            cmd_vel_history_.pop_front();
+        }
+    }
+
+    void cmd_vel_callback(const Twist::SharedPtr msg) {
+        if (escaping_) {
+            return;
+        }
+
+        const rclcpp::Time now = this->now();
+        prune_cmd_vel_history(now);
+        cmd_vel_history_.push_back(TimedTwist{now, *msg});
+    }
+
+    bool build_escape_twist_from_cmd_history(
+        Twist& escape_twist,
+        double& average_vx,
+        double& average_vy,
+        double& average_speed
+    ) {
+        const rclcpp::Time now = this->now();
+        prune_cmd_vel_history(now);
+
+        if (cmd_vel_history_.empty()) {
+            return false;
+        }
+
+        average_vx = 0.0;
+        average_vy = 0.0;
+
+        for (const auto& sample : cmd_vel_history_) {
+            average_vx += sample.twist.linear.x;
+            average_vy += sample.twist.linear.y;
+        }
+
+        average_vx /= static_cast<double>(cmd_vel_history_.size());
+        average_vy /= static_cast<double>(cmd_vel_history_.size());
+        average_speed =
+            std::sqrt(average_vx * average_vx + average_vy * average_vy);
+
+        if (average_speed < kMinimumRecordedSpeed) {
+            return false;
+        }
+
+        escape_twist.linear.x = -kEscapeSpeed * average_vx / average_speed;
+        escape_twist.linear.y = -kEscapeSpeed * average_vy / average_speed;
+        escape_twist.linear.z = 0.0;
+        escape_twist.angular.x = 0.0;
+        escape_twist.angular.y = 0.0;
+        escape_twist.angular.z = 0.0;
+
+        return true;
+    }
+
+    void execute_smart_escape_then_retry() {
+        Twist escape_twist;
+        double average_vx = 0.0;
+        double average_vy = 0.0;
+        double average_speed = 0.0;
+
+        if (
+            !build_escape_twist_from_cmd_history(
+                escape_twist,
+                average_vx,
+                average_vy,
+                average_speed
+            )
+        ) {
+            RCLCPP_WARN(
+                this->get_logger(),
+                "Velocity-based escape skipped because recent /cmd_vel linear speed is below %.2f m/s. Clearing costmaps and retrying goal %zu.",
+                kMinimumRecordedSpeed,
+                current_goal_index_ + 1
+            );
+
+            clear_costmaps();
+            timer_->reset();
+            return;
+        }
+
+        escape_twist_ = escape_twist;
+        escape_publish_count_ = 0;
+        escaping_ = true;
+
+        RCLCPP_WARN(
+            this->get_logger(),
+            "Velocity-based escape for goal %zu: recent average vx=%.2f, vy=%.2f, speed=%.2f. Escaping with vx=%.2f, vy=%.2f.",
+            current_goal_index_ + 1,
+            average_vx,
+            average_vy,
+            average_speed,
+            escape_twist_.linear.x,
+            escape_twist_.linear.y
+        );
+
+        if (escape_timer_) {
+            escape_timer_->cancel();
+        }
+
+        escape_timer_ = this->create_wall_timer(
+            std::chrono::milliseconds(kEscapeTimerPeriodMs),
+            std::bind(&GoalPublisherNode::publish_escape_velocity, this)
+        );
+    }
+
+    void publish_escape_velocity() {
+        if (!escaping_) {
+            return;
+        }
+
+        if (escape_publish_count_ < kEscapePublishLimit) {
+            cmd_vel_publisher_->publish(escape_twist_);
+            escape_publish_count_++;
+            return;
+        }
+
+        Twist stop_twist;
+        cmd_vel_publisher_->publish(stop_twist);
+
+        escaping_ = false;
+
+        if (escape_timer_) {
+            escape_timer_->cancel();
+        }
+
+        RCLCPP_INFO(
+            this->get_logger(),
+            "Velocity-based escape complete. Clearing costmaps and retrying goal %zu.",
+            current_goal_index_ + 1
+        );
+
+        clear_costmaps();
+        timer_->reset();
+    }
+
+    void handle_aborted_goal() {
+        if (current_goal_index_ >= goals_.size()) {
+            return;
+        }
+
+        abort_counts_[current_goal_index_]++;
+
+        if (abort_counts_[current_goal_index_] > kMaxAbortFailuresPerGoal) {
+            RCLCPP_ERROR(
+                this->get_logger(),
+                "Goal %zu was aborted more than %d times. Skipping this goal.",
+                current_goal_index_ + 1,
+                kMaxAbortFailuresPerGoal
+            );
+
+            clear_costmaps();
+            current_goal_index_++;
+            timer_->reset();
+            return;
+        }
+
+        RCLCPP_ERROR(
+            this->get_logger(),
+            "Goal %zu was aborted. Running smart escape before retry %d/%d.",
+            current_goal_index_ + 1,
+            abort_counts_[current_goal_index_],
+            kMaxAbortFailuresPerGoal
+        );
+
+        execute_smart_escape_then_retry();
+    }
+
     void result_callback(
         const GoalHandleNav::WrappedResult& result
     ) {
@@ -449,6 +675,7 @@ private:
 
                 clear_costmaps();
 
+                abort_counts_[current_goal_index_] = 0;
                 current_goal_index_++;
 
                 timer_->reset();
@@ -457,20 +684,7 @@ private:
 
             case rclcpp_action::ResultCode::ABORTED:
             {
-                std::ostringstream message;
-                message << "Goal "
-                        << current_goal_index_ + 1
-                        << " was aborted. Retrying the same goal.";
-
-                log_if_changed(
-                    "goal_result",
-                    LogLevel::Error,
-                    message.str()
-                );
-
-                clear_costmaps();
-
-                timer_->reset();
+                handle_aborted_goal();
                 break;
             }
 
@@ -518,10 +732,18 @@ private:
     rclcpp::Client<ClearEntireCostmap>::SharedPtr clear_global_costmap_client_;
     rclcpp::Client<ClearEntireCostmap>::SharedPtr clear_local_costmap_client_;
     rclcpp::Publisher<MarkerArray>::SharedPtr goal_marker_publisher_;
+    rclcpp::Publisher<Twist>::SharedPtr cmd_vel_publisher_;
+    rclcpp::Subscription<Twist>::SharedPtr cmd_vel_subscription_;
     rclcpp::TimerBase::SharedPtr timer_;
+    rclcpp::TimerBase::SharedPtr escape_timer_;
     std::vector<Goal> goals_;
+    std::vector<int> abort_counts_;
     std::unordered_map<std::string, std::string> last_log_messages_;
+    std::deque<TimedTwist> cmd_vel_history_;
+    Twist escape_twist_;
     size_t current_goal_index_;
+    int escape_publish_count_;
+    bool escaping_;
 };
 
 int main(int argc, char **argv) {
